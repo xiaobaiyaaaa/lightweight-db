@@ -25,8 +25,8 @@ public class QueryEngine {
                 return;
             }
 
-            // 3. 执行执行计划
-            List<Map<String, String>> resultSet = executeWhere(table, plan.conditions);
+            // 3. 执行计划
+            List<Map<String, String>> resultSet = executeWhere(table, plan.orConditions);
             resultSet = executeOrderBy(resultSet, plan.orderByColumn, plan.isDesc);
             executeSelectAndPrint(resultSet, plan.selectClause, startTime);
 
@@ -35,29 +35,45 @@ public class QueryEngine {
         }
     }
 
-    private List<Map<String, String>> executeWhere(Table table, List<Condition> conditions) {
-        if (conditions == null || conditions.isEmpty()) {
+    private List<Map<String, String>> executeWhere(Table table, List<List<Condition>> orConditions) {
+        if (orConditions == null || orConditions.isEmpty()) {
             return new ArrayList<>(table.getAllRows());
         }
 
-        List<Map<String, String>> currentSet = null;
-
-        for (Condition condition : conditions) {
-            // 核心优化：命中等值查询的哈希索引
-            if (condition.getOperator().equals("=") && table.hasIndex(condition.getColumn()) && currentSet == null) {
-                System.out.println("[执行计划] 命中哈希索引: " + condition.getColumn());
-                currentSet = table.getRowsByHashIndex(condition.getColumn(), condition.getValue());
-                continue;
+        if (orConditions.size() == 1) {
+            List<Condition> singleAndGroup = orConditions.get(0);
+            for (Condition condition : singleAndGroup) {
+                if (condition.getOperator().equals("=") && table.hasIndex(condition.getColumn())) {
+                    System.out.println("[执行计划] 命中哈希索引: " + condition.getColumn());
+                    List<Map<String, String>> indexedRows = table.getRowsByHashIndex(condition.getColumn(), condition.getValue());
+                    // 对索引结果进行剩余条件的内存过滤
+                    return indexedRows.stream()
+                            .filter(row -> evaluateOrConditions(row, orConditions))
+                            .collect(Collectors.toList());
+                }
             }
-
-            if (currentSet == null) currentSet = new ArrayList<>(table.getAllRows());
-
-            // 流式过滤
-            currentSet = currentSet.stream()
-                    .filter(condition::evaluate)
-                    .collect(Collectors.toList());
         }
-        return currentSet == null ? new ArrayList<>() : currentSet;
+
+        // 如果包含 OR 或没命中索引，回退为全表内存扫描过滤
+        return table.getAllRows().stream()
+                .filter(row -> evaluateOrConditions(row, orConditions))
+                .collect(Collectors.toList());
+    }
+
+    private boolean evaluateOrConditions(Map<String, String> row, List<List<Condition>> orConditions) {
+        // 外层遍历 OR 组：只要有一个 AND 组返回 true，整行就判定为 true
+        for (List<Condition> andGroup : orConditions) {
+            boolean andResult = true;
+            // 内层遍历 AND 组：必须所有条件都满足才算 true
+            for (Condition cond : andGroup) {
+                if (!cond.evaluate(row)) {
+                    andResult = false;
+                    break;
+                }
+            }
+            if (andResult) return true;
+        }
+        return false;
     }
 
     private List<Map<String, String>> executeOrderBy(List<Map<String, String>> resultSet, String orderByColumn, boolean isDesc) {

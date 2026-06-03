@@ -8,7 +8,7 @@ public class QueryParser {
     public static class QueryPlan {
         public String selectClause;
         public String tableName;
-        public List<Condition> conditions = new ArrayList<>();
+        public List<List<Condition>> orConditions = new ArrayList<>();
         public String orderByColumn;
         public boolean isDesc = false;
     }
@@ -51,12 +51,19 @@ public class QueryParser {
         }
 
         if (whereClause != null && !whereClause.isEmpty()) {
-            String[] condStrings = whereClause.split("(?i) AND ");
-            for (String condStr : condStrings) {
-                String op = extractOperator(condStr);
-                String[] parts = condStr.split(op);
-                if (parts.length != 2) throw new Exception("条件语法错误: " + condStr);
-                plan.conditions.add(new Condition(parts[0], op, parts[1]));
+            //先按 OR 拆分外层
+            String[] orParts = whereClause.split("(?i) OR ");
+            for (String orPart : orParts) {
+                List<Condition> andGroup = new ArrayList<>();
+                //再按 AND 拆分内层
+                String[] andParts = orPart.split("(?i) AND ");
+                for (String condStr : andParts) {
+                    String op = extractOperator(condStr);
+                    String[] parts = condStr.split(op);
+                    if (parts.length != 2) throw new Exception("条件语法错误: " + condStr);
+                    andGroup.add(new Condition(parts[0], op, parts[1]));
+                }
+                plan.orConditions.add(andGroup);
             }
         }
 

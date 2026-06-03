@@ -46,7 +46,7 @@ public class Table {
             index.computeIfAbsent(value, k -> new ArrayList<>()).add(i);
         }
         hashIndices.put(columnName, index);
-        System.out.println("[系统提示] 已在列 '" + columnName + "' 上建立哈希索引。");
+        System.out.println("已在列 '" + columnName + "' 上建立哈希索引。");
     }
 
     public boolean hasIndex(String columnName) {
