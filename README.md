@@ -34,30 +34,69 @@
 
 #### (1) 源码实现
 ```java
-public QueryPlan parse(String sql) {
-    String[] parts = sql.trim().split("(?i) WHERE "); 
-    String selectPart = parts[0].replaceFirst("(?i)^SELECT ", "").trim();
-    String[] fromParts = selectPart.split("(?i) FROM ");
-    
-    String projectionFields = fromParts[0].trim();
-    String tableName = fromParts[1].trim();
-    
-    QueryPlan plan = new QueryPlan(projectionFields, tableName);
-    
-    if (parts.length > 1) {
-        String[] orGroups = parts[1].split("(?i) OR ");
-        for (String orGroup : orGroups) {
-            List<Condition> andConditions = new ArrayList<>();
-            String[] andParts = orGroup.split("(?i) AND ");
-            for (String andPart : andParts) {
-                String op = extractOperator(andPart);
-                String[] kv = andPart.split(op);
-                andConditions.add(new Condition(kv[0].trim(), op, kv[1].trim()));
-            }
-            plan.getWherePipeline().add(andConditions);
-        }
+public QueryPlan parse(String sql) throws Exception {
+  QueryPlan plan = new QueryPlan();
+  sql = sql.trim().replaceAll(" +", " ");
+
+  if (!sql.toUpperCase().startsWith("SELECT ")) {
+    throw new Exception("语法错误：目前仅支持 SELECT 查询。");
+  }
+
+  String upperSql = sql.toUpperCase();
+  int fromIdx = upperSql.indexOf(" FROM ");
+  if (fromIdx == -1) throw new Exception("语法错误：缺少 FROM 关键字。");
+
+  plan.selectClause = sql.substring(7, fromIdx).trim();
+  String remainder = sql.substring(fromIdx + 6).trim();
+
+  String[] remainderParts = remainder.split(" ", 2);
+  plan.tableName = remainderParts[0].trim();
+
+  if (remainderParts.length == 1) return plan;
+
+  remainder = remainderParts[1].trim();
+  String upperRemainder = remainder.toUpperCase();
+  String whereClause = null;
+  String orderByClause = null;
+
+  if (upperRemainder.startsWith("WHERE ")) {
+    int orderByIdx = upperRemainder.indexOf(" ORDER BY ");
+    if (orderByIdx != -1) {
+      whereClause = remainder.substring(6, orderByIdx).trim();
+      orderByClause = remainder.substring(orderByIdx + 10).trim();
+    } else {
+      whereClause = remainder.substring(6).trim();
     }
-    return plan;
+  } else if (upperRemainder.startsWith("ORDER BY ")) {
+    orderByClause = remainder.substring(9).trim();
+  }
+
+  if (whereClause != null && !whereClause.isEmpty()) {
+    //先按 OR 拆分外层
+    String[] orParts = whereClause.split("(?i) OR ");
+    for (String orPart : orParts) {
+      List<Condition> andGroup = new ArrayList<>();
+      //再按 AND 拆分内层
+      String[] andParts = orPart.split("(?i) AND ");
+      for (String condStr : andParts) {
+        String op = extractOperator(condStr);
+        String[] parts = condStr.split(op);
+        if (parts.length != 2) throw new Exception("条件语法错误: " + condStr);
+        andGroup.add(new Condition(parts[0], op, parts[1]));
+      }
+      plan.orConditions.add(andGroup);
+    }
+  }
+
+  if (orderByClause != null && !orderByClause.isEmpty()) {
+    String[] orderParts = orderByClause.split(" ");
+    plan.orderByColumn = orderParts[0].trim();
+    if (orderParts.length > 1 && orderParts[1].equalsIgnoreCase("DESC")) {
+      plan.isDesc = true;
+    }
+  }
+
+  return plan;
 }
 ```
 
@@ -71,17 +110,28 @@ public QueryPlan parse(String sql) {
 
 #### (1) 核心源码实现
 ```java
-public class Table {
-    private List<Map<String, String>> rows = new ArrayList<>();
-    
-    private Map<String, Map<String, List<Integer>>> indexes = new HashMap<>();
+public void createHashIndex(String columnName) {
+  if (!columns.contains(columnName)) return;
+  Map<String, List<Integer>> index = new HashMap<>();
+  for (int i = 0; i < rows.size(); i++) {
+    String value = rows.get(i).get(columnName);
+    index.computeIfAbsent(value, k -> new ArrayList<>()).add(i);
+  }
+  hashIndices.put(columnName, index);
+  System.out.println("已在列 '" + columnName + "' 上建立哈希索引。");
+}
 
-    public List<Integer> getRowsByValue(String colName, String value) {
-        if (!indexes.containsKey(colName)) {
-            return null; 
-        }
-        return indexes.get(colName).get(value); 
-    }
+public boolean hasIndex(String columnName) {
+  return hashIndices.containsKey(columnName);
+}
+
+public List<Map<String, String>> getRowsByHashIndex(String columnName, String value) {
+  List<Integer> rowIndices = hashIndices.get(columnName).getOrDefault(value, new ArrayList<>());
+  List<Map<String, String>> result = new ArrayList<>();
+  for (int idx : rowIndices) {
+    result.add(rows.get(idx));
+  }
+  return result;
 }
 ```
 
@@ -95,22 +145,34 @@ public class Table {
 
 #### (1) 核心源码实现
 ```java
-public class Condition {
-    private String columnName;
-    private String operator;
-    private String targetValue;
+public boolean evaluate(Map<String, String> row) {
+  String rowValue = row.get(column);
+  if (rowValue == null) return false;
 
-    public boolean evaluate(String rowValue) {
-        if (rowValue == null) return false;
-        
-        try {
-            double numericRowVal = Double.parseDouble(rowValue);
-            double numericTargetVal = Double.parseDouble(this.targetValue);
-            return compareNumbers(numericRowVal, numericTargetVal, this.operator);
-        } catch (NumberFormatException e) {
-            return compareStrings(rowValue, this.targetValue, this.operator);
-        }
+  try {
+    double rVal = Double.parseDouble(rowValue);
+    double tVal = Double.parseDouble(value);
+    switch (operator) {
+      case "=": return rVal == tVal;
+      case ">": return rVal > tVal;
+      case "<": return rVal < tVal;
+      case ">=": return rVal >= tVal;
+      case "<=": return rVal <= tVal;
+      case "!=": return rVal != tVal;
+      default: throw new IllegalArgumentException("不支持的运算符: " + operator);
     }
+  } catch (NumberFormatException e) {
+    int cmp = rowValue.compareTo(value);
+    switch (operator) {
+      case "=": return cmp == 0;
+      case ">": return cmp > 0;
+      case "<": return cmp < 0;
+      case ">=": return cmp >= 0;
+      case "<=": return cmp <= 0;
+      case "!=": return cmp != 0;
+      default: throw new IllegalArgumentException("不支持的运算符: " + operator);
+    }
+  }
 }
 ```
 
@@ -124,28 +186,66 @@ public class Condition {
 
 #### (1) 核心源码实现
 ```java
-public void executeSelectAndPrint(List<Map<String, String>> resultSet, String selectClause) {
-    String normalizedSelect = selectClause.replace(" ", "").toUpperCase();
-    
-    if (normalizedSelect.contains("COUNT(")) {
-        executeOnePassAggregation(resultSet, selectClause);
-    } else {
-        executeStandardProjection(resultSet, selectClause);
+private void executeSelectAndPrint(List<Map<String, String>> resultSet, String selectClause, long startTime) {
+  if (resultSet.isEmpty()) {
+    System.out.println("0 rows affected.");
+    System.out.println("查询耗时: " + (System.currentTimeMillis() - startTime) + " ms\n");
+    return;
+  }
+
+  String upperSelect = selectClause.toUpperCase();
+  if (upperSelect.contains("COUNT(") || upperSelect.contains("SUM(") || upperSelect.contains("AVG(") ||
+          upperSelect.contains("MAX(") || upperSelect.contains("MIN(")) {
+    handleAggregation(resultSet, selectClause);
+  } else {
+    String[] cols = selectClause.equals("*") ? resultSet.get(0).keySet().toArray(new String[0]) : selectClause.split(",");
+
+    for (String col : cols) System.out.print(col.trim() + "\t|");
+    System.out.println("\n-------------------------------------------------");
+
+    for (Map<String, String> row : resultSet) {
+      for (String col : cols) System.out.print(row.get(col.trim()) + "\t|");
+      System.out.println();
     }
+  }
+
+  long endTime = System.currentTimeMillis();
+  System.out.println("\n返回 " + resultSet.size() + " 行数据.");
+  System.out.println("查询耗时: " + (endTime - startTime) + " ms\n");
 }
 
-private void executeOnePassAggregation(List<Map<String, String>> resultSet, String selectClause) {
-    String targetCol = extractColumnNameFromFunc(selectClause); 
-    int count = 0;
-    
-    for (Map<String, String> row : resultSet) {
-        String val = row.get(targetCol);
-        if (val != null) {
-            count++;
-        }
-    }
-    
-    System.out.println("COUNT(" + targetCol + ")\n-----------------\n" + count);
+private void handleAggregation(List<Map<String, String>> resultSet, String selectClause) {
+  String funcAndCol = selectClause.trim().toUpperCase();
+  String func = funcAndCol.substring(0, funcAndCol.indexOf('('));
+  String col = selectClause.substring(selectClause.indexOf('(') + 1, selectClause.indexOf(')')).trim();
+
+  double sum = 0, max = -Double.MAX_VALUE, min = Double.MAX_VALUE;
+  int count = 0;
+
+  for (Map<String, String> row : resultSet) {
+    String valStr = row.get(col);
+    if (valStr == null || valStr.isEmpty()) continue;
+
+    if (func.equals("COUNT")) { count++; continue; }
+
+    try {
+      double val = Double.parseDouble(valStr);
+      sum += val;
+      if (val > max) max = val;
+      if (val < min) min = val;
+      count++;
+    } catch (NumberFormatException ignored) {}
+  }
+
+  System.out.println(func + "(" + col + ")");
+  System.out.println("-------------------------");
+  switch (func) {
+    case "COUNT": System.out.println(count); break;
+    case "SUM": System.out.println(sum); break;
+    case "AVG": System.out.println(count == 0 ? 0 : sum / count); break;
+    case "MAX": System.out.println(count == 0 ? "NULL" : max); break;
+    case "MIN": System.out.println(count == 0 ? "NULL" : min); break;
+  }
 }
 ```
 
